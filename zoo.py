@@ -11,15 +11,21 @@
 import logging
 import math
 
+import eta.core.frameutils as etaf
+import eta.core.video as etav
 import numpy as np
 from PIL import Image
 import torch
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
+import fiftyone.core.fields as fof
 import fiftyone.core.labels as fol
 import fiftyone.core.models as fom
+import fiftyone.core.utils as fou
 import fiftyone.utils.torch as fout
 from fiftyone.utils.torch import ImageGetItem
+
+from . import media
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +56,7 @@ PROMPTS = {
 }
 
 VALID_MEDIA_TYPES = ("image", "video", "audio")
+VALID_DATASET_MODALITIES = ("video", "audio", "video+audio")
 VALID_MODALITIES = ("vision", "audio")
 VALID_EMBEDDING_DIMS = (128, 256, 512, 768)
 VALID_SOFT_TOKENS = (70, 140, 280, 560, 1120)
@@ -66,6 +73,13 @@ DEFAULT_MODALITIES = {
     "image": ("vision",),
     "video": ("vision",),
     "audio": ("audio",),
+}
+
+# media_type -> zero-shot class prompt template
+DEFAULT_TEXT_PROMPTS = {
+    "image": "a photo of a {}",
+    "video": "{}",
+    "audio": "{}",
 }
 
 
@@ -100,6 +114,9 @@ def _validate_classes(value):
 def _to_pil(img):
     if isinstance(img, Image.Image):
         return img.convert("RGB")
+
+    if isinstance(img, str):
+        return Image.open(img).convert("RGB")
 
     if isinstance(img, torch.Tensor):
         img = img.detach().cpu().numpy()
@@ -146,8 +163,13 @@ class EmbeddingGemma2Config(fout.TorchImageModelConfig):
             chunked, see ``long_media``)
         long_media ("truncate"): ``"truncate"`` or ``"chunk_mean"``
         chunk_seconds (30): chunk length for ``long_media="chunk_mean"``
+        mcap_video_topic (None): MCAP topic for frames. Defaults to the
+            first ``foxglove.CompressedVideo``/``CompressedImage`` topic
+        mcap_audio_topic (None): MCAP topic for audio. Defaults to the first
+            ``foxglove.RawAudio`` topic
         classes (None): class names for zero-shot classification
-        text_prompt ("a photo of a {}"): template for class prompts
+        text_prompt (None): template for class prompts. Defaults to
+            ``"a photo of a {}"`` for images and ``"{}"`` for video and audio
         logit_scale (100): softmax temperature for zero-shot scores
     """
 
@@ -225,10 +247,17 @@ class EmbeddingGemma2Config(fout.TorchImageModelConfig):
         self.chunk_seconds = self.parse_number(d, "chunk_seconds", default=30)
         _validate_positive("chunk_seconds", self.chunk_seconds)
 
+        self.mcap_video_topic = self.parse_string(
+            d, "mcap_video_topic", default=None
+        )
+        self.mcap_audio_topic = self.parse_string(
+            d, "mcap_audio_topic", default=None
+        )
+
         _validate_classes(self.classes)
 
         self.text_prompt = self.parse_string(
-            d, "text_prompt", default="a photo of a {}"
+            d, "text_prompt", default=DEFAULT_TEXT_PROMPTS[self.media_type]
         )
         _validate_text_prompt(self.text_prompt)
 
@@ -239,8 +268,9 @@ class EmbeddingGemma2Config(fout.TorchImageModelConfig):
 class EmbeddingGemma2Base(object):
     """Media-agnostic EmbeddingGemma 2 core.
 
-    Owns the weights, processor, device and dtype. All ``embed_*`` methods
-    return float32, L2-normalized arrays of shape
+    Owns the weights, processor, device and dtype, and the
+    :class:`fiftyone.core.models.Model` members shared by every media type.
+    All ``embed_*`` methods return float32, L2-normalized arrays of shape
     ``(num_inputs, embedding_dim)``.
 
     Args:
@@ -255,6 +285,7 @@ class EmbeddingGemma2Base(object):
         self._model = self._load_model()
         self._class_embeddings = None
         self._class_embeddings_key = None
+        self._preprocess = False
 
     @staticmethod
     def _resolve_device(device):
@@ -308,6 +339,28 @@ class EmbeddingGemma2Base(object):
     @property
     def can_embed_prompts(self):
         return True
+
+    @property
+    def transforms(self):
+        return None
+
+    @property
+    def preprocess(self):
+        return self._preprocess
+
+    @preprocess.setter
+    def preprocess(self, value):
+        self._preprocess = value
+
+    @property
+    def ragged_batches(self):
+        return False
+
+    def embed(self, arg):
+        return self.embed_all([arg])[0]
+
+    def predict(self, arg):
+        return self.predict_all([arg])[0]
 
     ###########################################################################
     # Runtime parameters
@@ -405,6 +458,28 @@ class EmbeddingGemma2Base(object):
     def chunk_seconds(self, value):
         _validate_positive("chunk_seconds", value)
         self.config.chunk_seconds = value
+
+    @property
+    def mcap_video_topic(self):
+        """MCAP topic for frames, or None to auto-detect."""
+        return self.config.mcap_video_topic
+
+    @mcap_video_topic.setter
+    def mcap_video_topic(self, value):
+        if value is not None and not isinstance(value, str):
+            raise TypeError("mcap_video_topic must be a string or None")
+        self.config.mcap_video_topic = value
+
+    @property
+    def mcap_audio_topic(self):
+        """MCAP topic for audio, or None to auto-detect."""
+        return self.config.mcap_audio_topic
+
+    @mcap_audio_topic.setter
+    def mcap_audio_topic(self, value):
+        if value is not None and not isinstance(value, str):
+            raise TypeError("mcap_audio_topic must be a string or None")
+        self.config.mcap_audio_topic = value
 
     @property
     def classes(self):
@@ -517,7 +592,8 @@ class EmbeddingGemma2Base(object):
         """Embeds images.
 
         Args:
-            images: a list of PIL images, numpy HWC arrays or CHW tensors
+            images: a list of PIL images, numpy HWC arrays, CHW tensors or
+                filepaths
 
         Returns:
             a ``(num_images, embedding_dim)`` array
@@ -544,7 +620,7 @@ class EmbeddingGemma2Base(object):
         self._require("vision")
         videos = [[_to_pil(f) for f in frames] for frames in videos]
         for frames in videos:
-            self._check_budget(num_frames=len(frames))
+            self._check_budget(len(frames))
 
         token = self._processor.video_token
         return self._forward(
@@ -638,13 +714,291 @@ class EmbeddingGemma2Base(object):
 
         return np.concatenate(results, axis=0)
 
-    def _check_budget(self, num_frames=0, audio_seconds=0.0, text_tokens=0):
-        tokens = self._budget_tokens(num_frames, audio_seconds, text_tokens)
+    def load_frames(self, path, start=None, end=None):
+        """Samples frames from a video file or MCAP per the current ``fps``,
+        ``max_frames`` and token budget.
+
+        Args:
+            path: a video or ``.mcap`` filepath
+            start (None): optional window start in seconds
+            end (None): optional window end in seconds
+
+        Returns:
+            a list of PIL images
+        """
+        max_frames, _ = self.fit_budget(num_frames=self.config.max_frames)
+        frames, _, _ = media.load_frames(
+            path,
+            fps=self.config.fps,
+            max_frames=max_frames,
+            topic=self.config.mcap_video_topic,
+            start=start,
+            end=end,
+        )
+        return frames
+
+    def _fit_frames(self, frames):
+        max_frames, _ = self.fit_budget(num_frames=len(frames))
+        if len(frames) <= max_frames:
+            return list(frames)
+
+        idx = np.linspace(0, len(frames) - 1, max_frames, dtype=int)
+        return [frames[i] for i in idx]
+
+    def embed_audio_file(self, path, start=None, end=None):
+        """Embeds the audio of an audio file, video file or MCAP.
+
+        With ``long_media="truncate"`` the first ``max_audio_seconds`` are
+        used. With ``long_media="chunk_mean"`` the whole track is split into
+        ``chunk_seconds`` chunks whose embeddings are averaged.
+
+        Args:
+            path: a filepath
+            start (None): optional window start in seconds
+            end (None): optional window end in seconds
+
+        Returns:
+            a ``(embedding_dim,)`` array
+        """
+        topic = self.config.mcap_audio_topic
+        if self.config.long_media == "truncate":
+            wave = media.load_audio(
+                path,
+                max_seconds=self.config.max_audio_seconds,
+                topic=topic,
+                start=start,
+                end=end,
+            )
+            return self.embed_audio([wave])[0]
+
+        wave = media.load_audio(path, topic=topic, start=start, end=end)
+        n = int(self.config.chunk_seconds * AUDIO_SAMPLE_RATE)
+        chunks = [wave[i : i + n] for i in range(0, len(wave), n)]
+        if len(chunks) > 1 and len(chunks[-1]) < AUDIO_SAMPLE_RATE:
+            chunks = chunks[:-1]
+
+        vectors = np.concatenate(
+            [self.embed_audio(chunks[i : i + 8]) for i in range(0, len(chunks), 8)]
+        )
+        mean = vectors.mean(axis=0)
+        return (mean / np.linalg.norm(mean)).astype(np.float32)
+
+    def embed_video_audio(self, path, start=None, end=None):
+        """Embeds the frames and audio of a video file or MCAP as one
+        interleaved input (``<|video|> <|audio|>``).
+
+        Requires both encoders (``modalities=["vision", "audio"]``). Audio
+        gets whatever context the frames leave, up to ``max_audio_seconds``.
+
+        Args:
+            path: a filepath
+            start (None): optional window start in seconds
+            end (None): optional window end in seconds
+
+        Returns:
+            a ``(embedding_dim,)`` array
+        """
+        self._require("vision")
+        self._require("audio")
+        frames = self.load_frames(path, start=start, end=end)
+        _, audio_seconds = self.fit_budget(
+            num_frames=len(frames),
+            audio_seconds=self.config.max_audio_seconds,
+            text_tokens=1,
+        )
+        wave = media.load_audio(
+            path,
+            max_seconds=audio_seconds,
+            topic=self.config.mcap_audio_topic,
+            start=start,
+            end=end,
+        )
+        p = self._processor
+        item = {
+            "text": f"{p.video_token} {p.audio_token}",
+            "videos": [frames],
+            "audio": [wave],
+        }
+        return self.embed_interleaved([item])[0]
+
+    def _embed_path(self, path, modality):
+        if modality == "video":
+            return self.embed_frames([self.load_frames(path)])[0]
+        if modality == "audio":
+            return self.embed_audio_file(path)
+
+        return self.embed_video_audio(path)
+
+    def _default_modality(self, modality):
+        if modality is None:
+            modality = {"video": "video", "audio": "audio"}.get(
+                self.media_type
+            )
+            if modality is None:
+                raise ValueError(
+                    "Pass modality='video', 'audio' or 'video+audio'"
+                )
+
+        _validate_choice("modality", modality, VALID_DATASET_MODALITIES)
+        if "video" in modality:
+            self._require("vision")
+        if "audio" in modality:
+            self._require("audio")
+
+        return modality
+
+    def embed_dataset(
+        self,
+        samples,
+        embeddings_field=None,
+        modality=None,
+        filepath_field="filepath",
+        skip_existing=False,
+        skip_failures=True,
+        batch_size=64,
+        progress=None,
+    ):
+        """Embeds the media of each sample, choosing the decoder by file
+        extension (video files, audio files, ``.mcap``).
+
+        Use this where ``compute_embeddings()`` does not apply: audio, the
+        audio track of videos, video+audio together, and ``multimodal``
+        collections such as MCAP. For grouped datasets, pass a slice view
+        from ``select_group_slices()``.
+
+        Args:
+            samples: a :class:`fiftyone.core.collections.SampleCollection`
+            embeddings_field (None): a sample field in which to store the
+                embeddings. If None, the embeddings are returned
+            modality (None): ``"video"``, ``"audio"`` or ``"video+audio"``.
+                Defaults to the model's ``media_type``
+            filepath_field ("filepath"): the field containing media paths
+            skip_existing (False): skip samples whose ``embeddings_field`` is
+                already populated
+            skip_failures (True): log and store None for samples that fail
+                instead of raising
+            batch_size (64): number of samples written to the database at a
+                time
+            progress (None): whether to render a progress bar
+
+        Returns:
+            None if ``embeddings_field`` is given, else a list of arrays (None
+            for failures)
+        """
+        modality = self._default_modality(modality)
+
+        if samples.media_type == "group":
+            raise ValueError(
+                "Grouped collections are not supported directly; pass "
+                "samples.select_group_slices(<slice>)"
+            )
+
+        view = samples
+        if embeddings_field is not None:
+            dataset = samples._dataset
+            if not dataset.has_sample_field(embeddings_field):
+                dataset.add_sample_field(embeddings_field, fof.VectorField)
+            if skip_existing:
+                view = view.exists(embeddings_field, False)
+
+        ids, paths = view.values(["id", filepath_field])
+
+        results = []
+        pending = {}
+        with fou.ProgressBar(total=len(ids), progress=progress) as pb:
+            for sample_id, path in pb(zip(ids, paths)):
+                try:
+                    if path is None:
+                        raise ValueError(f"Sample has no '{filepath_field}'")
+                    embedding = self._embed_path(path, modality)
+                except Exception as e:
+                    if not skip_failures:
+                        raise
+                    logger.warning("Sample: %s\nError: %s\n", sample_id, e)
+                    embedding = None
+
+                if embeddings_field is None:
+                    results.append(embedding)
+                    continue
+
+                pending[sample_id] = embedding
+                if len(pending) >= batch_size:
+                    samples.set_values(embeddings_field, pending, key_field="id")
+                    pending = {}
+
+        if embeddings_field is None:
+            return results
+
+        if pending:
+            samples.set_values(embeddings_field, pending, key_field="id")
+
+    def classify_dataset(
+        self,
+        samples,
+        label_field,
+        embeddings_field=None,
+        modality=None,
+        filepath_field="filepath",
+        skip_failures=True,
+        progress=None,
+    ):
+        """Zero-shot classifies each sample against ``classes``.
+
+        Works on any collection :meth:`embed_dataset` supports. Pass an
+        existing ``embeddings_field`` to reuse stored embeddings instead of
+        decoding media again.
+
+        Args:
+            samples: a :class:`fiftyone.core.collections.SampleCollection`
+            label_field: the sample field in which to store
+                :class:`fiftyone.core.labels.Classification` labels
+            embeddings_field (None): an optional field of stored embeddings
+                from this model at the current ``embedding_dim``
+            modality (None): see :meth:`embed_dataset`
+            filepath_field ("filepath"): the field containing media paths
+            skip_failures (True): see :meth:`embed_dataset`
+            progress (None): whether to render a progress bar
+        """
+        # fail before decoding any media if classes is unset
+        self._get_class_embeddings()
+
+        if embeddings_field is not None:
+            ids, vectors = samples.values(["id", embeddings_field])
+        else:
+            ids = samples.values("id")
+            vectors = self.embed_dataset(
+                samples,
+                modality=modality,
+                filepath_field=filepath_field,
+                skip_failures=skip_failures,
+                progress=progress,
+            )
+
+        keep = [(i, v) for i, v in zip(ids, vectors) if v is not None]
+        if not keep:
+            return
+
+        matrix = np.stack([np.asarray(v, dtype=np.float32) for _, v in keep])
+        if matrix.shape[1] != self.config.embedding_dim:
+            raise ValueError(
+                f"Stored embeddings have dimension {matrix.shape[1]} but "
+                f"embedding_dim is {self.config.embedding_dim}"
+            )
+
+        labels = self._classify(matrix)
+        samples.set_values(
+            label_field,
+            {i: label for (i, _), label in zip(keep, labels)},
+            key_field="id",
+        )
+
+    def _check_budget(self, num_frames):
+        tokens = self._budget_tokens(num_frames)
         if tokens > MAX_CONTEXT_TOKENS:
             raise ValueError(
                 f"{num_frames} frames at {self.config.video_max_soft_tokens} "
-                f"soft tokens + {audio_seconds:.1f}s audio needs up to "
-                f"{tokens} tokens; the model supports {MAX_CONTEXT_TOKENS}"
+                f"soft tokens need up to {tokens} tokens; the model supports "
+                f"{MAX_CONTEXT_TOKENS}"
             )
 
     def _budget_tokens(self, num_frames=0, audio_seconds=0.0, text_tokens=0):
@@ -659,27 +1013,24 @@ class EmbeddingGemma2Base(object):
     def fit_budget(self, num_frames=0, audio_seconds=0.0, text_tokens=0):
         """Shrinks a frame count and audio length to fit the context window.
 
-        Frames are reduced first (to a minimum of 1), then audio is
-        truncated. A warning is logged when anything is reduced.
+        Video keeps priority: frames are reduced only if they alone overflow
+        the window, then audio is truncated to the remaining room. A warning
+        is logged when anything is reduced.
 
         Args:
             num_frames (0): requested video frames
-            audio_seconds (0.0): requested audio duration
+            audio_seconds (0.0): requested audio duration (capped at
+                ``max_audio_seconds``)
             text_tokens (0): tokens used by any accompanying text
 
         Returns:
             a ``(num_frames, audio_seconds)`` tuple
         """
         audio_seconds = min(audio_seconds, self.config.max_audio_seconds)
-        if (
-            self._budget_tokens(num_frames, audio_seconds, text_tokens)
-            <= MAX_CONTEXT_TOKENS
-        ):
-            return num_frames, audio_seconds
 
         per_frame = self.config.video_max_soft_tokens + 2
-        fixed = self._budget_tokens(0, audio_seconds, text_tokens)
-        fit_frames = max(1, (MAX_CONTEXT_TOKENS - fixed) // per_frame)
+        frame_room = MAX_CONTEXT_TOKENS - self._budget_tokens(0, 0.0, text_tokens)
+        fit_frames = max(1, frame_room // per_frame)
         if num_frames > fit_frames:
             logger.warning(
                 "Reducing %d frames to %d to fit %d tokens",
@@ -689,24 +1040,30 @@ class EmbeddingGemma2Base(object):
             )
             num_frames = fit_frames
 
+        if audio_seconds <= 0:
+            return num_frames, audio_seconds
+
         if (
             self._budget_tokens(num_frames, audio_seconds, text_tokens)
             > MAX_CONTEXT_TOKENS
         ):
-            fixed = self._budget_tokens(num_frames, 0.0, text_tokens) + 2
+            # + 2 for the audio start/end tokens, - 1 for rounding up
+            used = self._budget_tokens(num_frames, 0.0, text_tokens) + 2
             fit_seconds = (
-                MAX_CONTEXT_TOKENS - fixed - 1
+                MAX_CONTEXT_TOKENS - used - 1
             ) / AUDIO_TOKENS_PER_SECOND
             if fit_seconds <= 0:
                 raise ValueError(
                     "No room for audio in the context window; reduce "
-                    "video_max_soft_tokens or text length"
+                    "max_frames, video_max_soft_tokens or text length"
                 )
             logger.warning(
-                "Truncating audio from %.1fs to %.1fs to fit %d tokens",
+                "Truncating audio from %.1fs to %.1fs to fit %d tokens "
+                "alongside %d frames",
                 audio_seconds,
                 fit_seconds,
                 MAX_CONTEXT_TOKENS,
+                num_frames,
             )
             audio_seconds = fit_seconds
 
@@ -799,28 +1156,32 @@ class EmbeddingGemma2ImageModel(
     def __init__(self, config):
         fom.SupportsGetItem.__init__(self)
         EmbeddingGemma2Base.__init__(self, config)
-        self._preprocess = False
         self._fields = {}
+        self._mode = None
 
     @property
     def media_type(self):
         return "image"
 
     @property
-    def transforms(self):
-        return None
+    def mode(self):
+        """The media type of the collection being processed.
 
-    @property
-    def preprocess(self):
-        return self._preprocess
+        ``compute_embeddings()`` sets this while it runs; it is only used to
+        warn when an image model is applied to a video collection.
+        """
+        return self._mode
 
-    @preprocess.setter
-    def preprocess(self, value):
-        self._preprocess = value
-
-    @property
-    def ragged_batches(self):
-        return False
+    @mode.setter
+    def mode(self, value):
+        if value == "video":
+            logger.warning(
+                "Image model applied to a video collection: every frame gets "
+                "its own embedding in a frame-level field. For one vector "
+                "per video, load with media_type='video' (or "
+                "media_type=dataset.media_type)"
+            )
+        self._mode = value
 
     @property
     def has_collate_fn(self):
@@ -837,14 +1198,101 @@ class EmbeddingGemma2ImageModel(
     def build_get_item(self, field_mapping=None):
         return ImageGetItem(field_mapping=field_mapping, raw_inputs=True)
 
-    def embed(self, arg):
-        return self.embed_all([arg])[0]
-
     def embed_all(self, args):
         return self.embed_images(list(args))
 
-    def predict(self, arg):
-        return self.predict_all([arg])[0]
-
     def predict_all(self, args):
         return self._classify(self.embed_images(list(args)))
+
+
+class EmbeddingGemma2VideoModel(
+    EmbeddingGemma2Base,
+    fom.Model,
+    fom.EmbeddingsMixin,
+    fom.PromptMixin,
+):
+    """EmbeddingGemma 2 for video datasets: one vector per video or clip.
+
+    FiftyOne passes an ``FFmpegVideoReader`` per sample; only its path and
+    frame range are used, and frames are decoded by timestamp with PyAV.
+    Clip views are embedded over the clip's time window.
+
+    ``embed()`` and ``predict()`` also accept a video or ``.mcap`` filepath,
+    or a list of frames (PIL images or numpy HWC arrays).
+
+    Args:
+        config: an :class:`EmbeddingGemma2Config`
+    """
+
+    @property
+    def media_type(self):
+        return "video"
+
+    def _to_frames(self, arg):
+        if isinstance(arg, etav.VideoReader):
+            first, last = etaf.parse_frame_ranges(arg.frames).limits
+            # container frame counts can be wrong, so full videos use the
+            # decoded duration instead of a window derived from them
+            if first <= 1 and last >= arg.total_frame_count:
+                return self.load_frames(arg.inpath)
+
+            fps = arg.frame_rate
+            return self.load_frames(
+                arg.inpath, start=(first - 1) / fps, end=last / fps
+            )
+
+        if isinstance(arg, str):
+            return self.load_frames(arg)
+
+        return self._fit_frames(arg)
+
+    def embed_all(self, args):
+        return self.embed_frames([self._to_frames(arg) for arg in args])
+
+    def predict_all(self, args):
+        return self._classify(self.embed_all(args))
+
+
+class EmbeddingGemma2AudioModel(
+    EmbeddingGemma2Base,
+    fom.Model,
+    fom.EmbeddingsMixin,
+    fom.PromptMixin,
+):
+    """EmbeddingGemma 2 for audio.
+
+    FiftyOne's ``compute_embeddings()`` and ``apply_model()`` do not accept
+    audio, so use :meth:`embed_dataset` and :meth:`classify_dataset`. Audio
+    is read from audio files, the audio track of video files, or MCAP
+    ``foxglove.RawAudio`` topics.
+
+    ``embed()`` and ``predict()`` accept a filepath or a 16 kHz mono float32
+    waveform.
+
+    Args:
+        config: an :class:`EmbeddingGemma2Config`
+    """
+
+    @property
+    def media_type(self):
+        return "audio"
+
+    def embed_all(self, args):
+        args = list(args)
+        vectors = [None] * len(args)
+        waves = []
+        for i, arg in enumerate(args):
+            if isinstance(arg, str):
+                vectors[i] = self.embed_audio_file(arg)
+            else:
+                waves.append((i, arg))
+
+        if waves:
+            embedded = self.embed_audio([w for _, w in waves])
+            for (i, _), e in zip(waves, embedded):
+                vectors[i] = e
+
+        return np.stack(vectors)
+
+    def predict_all(self, args):
+        return self._classify(self.embed_all(args))

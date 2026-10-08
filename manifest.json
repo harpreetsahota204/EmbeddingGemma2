@@ -1,12 +1,12 @@
 {
     "name": "embeddinggemma2",
-    "url": "https://github.com/harpreetsahota204/embeddinggemma2",
+    "url": "https://github.com/harpreetsahota204/EmbeddingGemma2",
     "models": [
         {
             "base_name": "google/embeddinggemma-2",
             "base_filename": "embeddinggemma-2",
             "author": "Google",
-            "license": "Gemma",
+            "license": "Apache-2.0",
             "source": "https://huggingface.co/google/embeddinggemma-2",
             "description": "EmbeddingGemma 2 maps text, images, video and audio into one 768d embedding space (Matryoshka 768/512/256/128). Pass media_type='image', 'video' or 'audio' to load_zoo_model().",
             "tags": [

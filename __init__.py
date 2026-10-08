@@ -4,18 +4,21 @@ One manifest entry; ``load_zoo_model("google/embeddinggemma-2",
 media_type=...)`` picks the image, video or audio model class.
 """
 
-import logging
-
 from huggingface_hub import snapshot_download
 
 from .zoo import (
     DEFAULT_MODEL_PATH,
-    VALID_MEDIA_TYPES,
+    EmbeddingGemma2AudioModel,
     EmbeddingGemma2Config,
     EmbeddingGemma2ImageModel,
+    EmbeddingGemma2VideoModel,
 )
 
-logger = logging.getLogger(__name__)
+_MODEL_CLASSES = {
+    "image": EmbeddingGemma2ImageModel,
+    "video": EmbeddingGemma2VideoModel,
+    "audio": EmbeddingGemma2AudioModel,
+}
 
 
 def download_model(model_name, model_path):
@@ -47,15 +50,5 @@ def load_model(model_name=None, model_path=None, **kwargs):
     config_dict = {"model_path": model_path or DEFAULT_MODEL_PATH}
     config_dict.update(kwargs)
 
-    media_type = config_dict.get("media_type", "image")
-    if media_type not in VALID_MEDIA_TYPES:
-        raise ValueError(
-            f"media_type must be one of {VALID_MEDIA_TYPES}, got '{media_type}'"
-        )
-
     config = EmbeddingGemma2Config(config_dict)
-
-    if media_type == "image":
-        return EmbeddingGemma2ImageModel(config)
-
-    raise NotImplementedError(f"media_type='{media_type}' is not built yet")
+    return _MODEL_CLASSES[config.media_type](config)
