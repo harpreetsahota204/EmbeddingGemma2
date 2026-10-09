@@ -214,7 +214,7 @@ Set at load time with `load_zoo_model(..., name=value)`. Everything except the f
 
 ## Validation
 
-Every result above comes from scripts in `checks/`, one per build phase:
+Results measured while building this integration:
 
 | Check | Result |
 |---|---|
@@ -224,6 +224,7 @@ Every result above comes from scripts in `checks/`, one per build phase:
 | quickstart text→image precision@5 / 7-class zero-shot | 0.95 / 0.87 |
 | ESC-50 text→audio precision@5 / zero-shot | 0.83 / 0.75 |
 | VGGSound 30 clips, 309-class zero-shot top-1 / top-5 | video 0.40 / 0.67, audio 0.13 / 0.23, video+audio 0.37 / 0.70 |
+| VGGSound 200 clips, still frame or soundtrack → its own clip in a video index (top-1) | image 0.99, audio 0.12 |
 
 Sample sizes are small (3 to 204 items); treat these as smoke tests, not benchmarks.
 
